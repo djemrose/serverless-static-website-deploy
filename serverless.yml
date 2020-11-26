@@ -1,0 +1,152 @@
+service: ${self:custom.WEBSITE_NAME}-website
+
+custom:
+  ############
+  # START variables to modify.
+  ############
+  AWS_PROFILE: # Enter aws credentials profile name here
+  WEBSITE_NAME: website-name
+  WEBSITE_BUCKET_NAME: website-bucket-name
+  CLOUDFRONT_IDENTITY: enter cloudfront identity
+  LOCAL_DEPLOY_DIRECTORY: public
+  CLOUDFRONT_COMMENT: # Comment here will show in Cloudfront console.
+  SLS_DEPLOY_BUCKET_NAME: bucket-name # What is the appended bucket where you want Cloudformation tmeplate to save? I just call it: serverless-deployment-packages
+  LAMBDA_REDIRECT_FUNCTION_ARN: arn:aws:lambda:us-east-1:XXXXXX # Should be an already existing function. Lambda@Edge redirection for default root objects at any path. Resolves /url as /url/ displaying /url/index.html content for example.
+  ############
+  # END variables to modify.
+  ############
+  cloudfrontInvalidate:
+    distributionIdKey: CloudFrontDistributionId
+    items:
+      - "/*"
+  deploymentBucket:
+    versioning: false
+    accelerate: false # Up to you.
+  s3Sync:
+    - bucketName: ${self:custom.WEBSITE_BUCKET_NAME}
+      localDir: ${self:custom.LOCAL_DEPLOY_DIRECTORY}
+      deleteRemoved: true # Removes files not in the locally deployed folder from the bucket.
+      acl: private
+      defaultContentType: text/html
+      params:
+        # We will rely on Cloudfront Invalidations to clear caching.
+        # Otherwise set "**/*.html" to "public, max-age=0, must-revalidate"
+        - "**/*.html":
+            CacheControl: "public, max-age=31536000, immutable"
+        - "page-data/**/*.json":
+            CacheControl: "public, max-age=31536000, immutable"
+        - "static/**/*":
+            CacheControl: "public, max-age=31536000, immutable"
+        - "icons/**/*":
+            CacheControl: "public, max-age=31536000, immutable"
+        - "**/*!(sw).js":
+            CacheControl: "public, max-age=31536000, immutable"
+        - "**/*.css":
+            CacheControl: "public, max-age=31536000, immutable"
+        - "sw.js":
+            CacheControl: "public, max-age=0, must-revalidate"
+
+plugins:
+  - serverless-s3-sync
+  - serverless-deployment-bucket
+  - serverless-cloudfront-invalidate
+
+provider:
+  name: aws
+  stage: ${opt:stage, 'production'}
+  region: ${opt:region, 'ap-southeast-2'}
+  stackName: ${self:service}
+  profile: ${self:custom.AWS_PROFILE}
+  # I like to deploy all cloudformation templates into 1 bucket. Easier to manage for everything and doesn't polute s3 with new buckets when not necessary.
+  # I used this same bucket for all deployment templates for a specific region. Keep them neat and tidy and compartmentalised!
+  deploymentBucket:
+    name: ${self:provider.region}-${self:custom.SLS_DEPLOY_BUCKET_NAME}
+    serverSideEncryption: AES256
+  # Folder name inside cloudformation deployment bucket.
+  deploymentPrefix: sls
+
+resources:
+  Resources:
+    FrontendBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.WEBSITE_BUCKET_NAME}
+        AccessControl: Private
+        WebsiteConfiguration:
+          IndexDocument: index.html
+          ErrorDocument: 404.html
+        PublicAccessBlockConfiguration:
+            BlockPublicAcls: true
+            BlockPublicPolicy: true
+            IgnorePublicAcls: true
+            RestrictPublicBuckets: true
+    BucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket: 
+          Ref: FrontendBucket
+        PolicyDocument:
+          Statement:
+            - Action:
+                - 's3:GetObject'
+              Effect: Allow
+              Resource: 'arn:aws:s3:::${self:custom.WEBSITE_BUCKET_NAME}/*'
+              Principal:
+                AWS: arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${self:custom.CLOUDFRONT_IDENTITY}
+    CloudFrontDistribution:
+      Type: AWS::CloudFront::Distribution
+      Properties:
+        DistributionConfig:
+          Origins:
+            - DomainName: ${self:custom.WEBSITE_BUCKET_NAME}.s3.amazonaws.com
+              Id: S3Origin
+              S3OriginConfig:
+                OriginAccessIdentity: origin-access-identity/cloudfront/${self:custom.CLOUDFRONT_IDENTITY}
+          Enabled: true
+          Comment: ${self:custom.CLOUDFRONT_COMMENT}
+          DefaultRootObject: index.html
+          # 1. Enabling aliases adds ability for this Cloudfront address to be resolved at that domain.
+          # Aliases:
+          #   - ${self:custom.WEBSITE_NAME}
+          # By default we only output cloudfront url without aliases.
+          # 2. If we enable Aliases above - we need to add the AcmCertificateArn, SslSupportMethod & disable the CloudFrontDefaultCertificate.
+          ViewerCertificate:
+            # AcmCertificateArn: String
+            # SslSupportMethod: sni-only
+            CloudFrontDefaultCertificate: true
+            MinimumProtocolVersion: TLSv1.3
+          HttpVersion: http2
+          IPV6Enabled: true
+          DefaultCacheBehavior:
+            TargetOriginId: S3Origin
+            AllowedMethods:
+              - GET
+              - HEAD
+            ForwardedValues:
+              QueryString: false
+              Cookies:
+                Forward: none
+            Compress: true
+            LambdaFunctionAssociations: 
+              - EventType: origin-request
+                IncludeBody: false
+                LambdaFunctionARN: ${self:custom.LAMBDA_REDIRECT_FUNCTION_ARN}
+            ViewerProtocolPolicy: redirect-to-https
+            SmoothStreaming: false
+          CustomErrorResponses:
+            - ErrorCode: 404
+              ResponsePagePath: /404.html
+              ResponseCode: 404
+              ErrorCachingMinTTL: 30
+            # S3 returns 403 error for access denied pages (pages that don't exist).
+            - ErrorCode: 403
+              ResponsePagePath: /404.html
+              ResponseCode: 403
+              ErrorCachingMinTTL: 30
+          PriceClass: PriceClass_All
+          
+  Outputs:
+    CloudFrontDistributionId:
+      Description: CloudFront Distribution id.
+      Value:
+        Ref: CloudFrontDistribution
